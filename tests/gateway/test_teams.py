@@ -1140,3 +1140,87 @@ class TestTeamsRequireMention:
         adapter = self._make_adapter(**extra)
         assert adapter._require_mention is expected
         assert adapter._extra.get("require_mention") == yaml_value  # extras stay readable on the instance
+
+
+# ---------------------------------------------------------------------------
+# Tests: edit_message (in-place updates for streaming / tool-progress bubbles)
+# ---------------------------------------------------------------------------
+
+class TestTeamsEditMessage:
+    """``edit_message`` must update the exact activity we posted, in the conversation it was
+    posted to: a channel reply lives in the ``;messageid=`` thread, not the bare chat id."""
+
+    CHANNEL = "19:chan@thread.tacv2;messageid=1700000000001"
+
+    def _make_adapter(self):
+        adapter = TeamsAdapter(_make_config(client_id="bot-id", client_secret="secret", tenant_id="tenant"))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        adapter._app.reply = AsyncMock(return_value=SimpleNamespace(id="1700000000099"))
+        adapter._app.send = AsyncMock(return_value=SimpleNamespace(id="a-flat-1"))
+        self.ops = MagicMock()
+        self.ops.update = AsyncMock()
+        adapter._app.api.conversations.activities = MagicMock(return_value=self.ops)
+        return adapter
+
+    @pytest.mark.anyio
+    async def test_edit_targets_the_thread_a_reply_was_posted_to(self):
+        adapter = self._make_adapter()
+        sent = await adapter.send(self.CHANNEL, "working…", reply_to="1700000000042")
+
+        result = await adapter.edit_message(self.CHANNEL, sent.message_id, "done ✅")
+
+        assert result.success and result.message_id == sent.message_id
+        adapter._app.api.conversations.activities.assert_called_once_with(
+            "19:chan@thread.tacv2;messageid=1700000000042")
+        activity_id, activity = self.ops.update.await_args.args
+        assert activity_id == sent.message_id
+        assert "done" in activity.text
+
+    @pytest.mark.anyio
+    async def test_edit_of_a_flat_send_uses_the_chat_id(self):
+        adapter = self._make_adapter()
+        sent = await adapter.send("a:personal-chat", "hi")
+
+        assert (await adapter.edit_message("a:personal-chat", sent.message_id, "hi again")).success
+        adapter._app.api.conversations.activities.assert_called_once_with("a:personal-chat")
+
+    @pytest.mark.anyio
+    async def test_unknown_message_falls_back_to_chat_id(self):
+        adapter = self._make_adapter()
+        assert (await adapter.edit_message("a:chat", "never-sent", "x")).success
+        adapter._app.api.conversations.activities.assert_called_once_with("a:chat")
+
+    @pytest.mark.anyio
+    async def test_api_failure_reports_retryable_failure_so_callers_send_anew(self):
+        adapter = self._make_adapter()
+        self.ops.update.side_effect = RuntimeError("429 throttled")
+
+        result = await adapter.edit_message("a:chat", "m1", "x")
+
+        assert not result.success and result.retryable
+
+    @pytest.mark.anyio
+    async def test_overlong_edit_is_truncated_to_one_message_not_split(self):
+        adapter = self._make_adapter()
+        await adapter.edit_message("a:chat", "m1", "x" * (TeamsAdapter.MAX_MESSAGE_LENGTH * 2))
+
+        self.ops.update.assert_awaited_once()
+        _, activity = self.ops.update.await_args.args
+        assert len(activity.text) <= TeamsAdapter.MAX_MESSAGE_LENGTH
+
+    @pytest.mark.anyio
+    async def test_conversation_map_stays_bounded(self):
+        adapter = self._make_adapter()
+        ids = iter(range(10**6))
+        adapter._app.send = AsyncMock(side_effect=lambda *a, **k: SimpleNamespace(id=f"m{next(ids)}"))
+        for _ in range(TeamsAdapter._SENT_CONVS_MAX + 25):
+            await adapter.send("a:chat", "hi")
+
+        assert len(adapter._sent_convs) == TeamsAdapter._SENT_CONVS_MAX
+        assert "m0" not in adapter._sent_convs  # oldest evicted first
+
+    @pytest.mark.anyio
+    async def test_edit_without_app_fails_cleanly(self):
+        adapter = TeamsAdapter(_make_config(client_id="bot-id", client_secret="secret", tenant_id="tenant"))
+        assert not (await adapter.edit_message("a:chat", "m1", "x")).success
