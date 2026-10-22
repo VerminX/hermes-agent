@@ -1355,6 +1355,30 @@ class TestTeamsAgentCards:
         assert activity.attachments[0].content == _CARD
 
     @pytest.mark.anyio
+    async def test_card_gets_a_plain_text_summary_for_previews(self):
+        adapter = self._make_adapter()
+        card = {"type": "AdaptiveCard", "version": "1.5", "body": [
+            {"type": "TextBlock", "text": "**PR Review Bot** · PR 7", "isSubtle": True},
+            {"type": "TextBlock", "text": "🔴 Blocking `issues`", "weight": "Bolder"}]}
+        await adapter.send("a:chat", _card_block(card))
+        assert self._sent_activity(adapter._app.send).summary == "🔴 Blocking issues"
+
+    @pytest.mark.anyio
+    async def test_explicit_summary_wins_and_is_stripped_from_the_card(self):
+        adapter = self._make_adapter()
+        await adapter.send("a:chat", _card_block(dict(_CARD, hermes_summary="Review done: 0 findings")))
+        activity = self._sent_activity(adapter._app.send)
+        assert activity.summary == "Review done: 0 findings"
+        assert "hermes_summary" not in activity.attachments[0].content
+
+    @pytest.mark.anyio
+    async def test_edited_card_keeps_a_summary(self):
+        adapter = self._make_adapter()
+        await adapter.edit_message("a:chat", "m9", _card_block(_CARD))
+        _, activity = self.ops.update.await_args.args
+        assert activity.summary == "Findings"
+
+    @pytest.mark.anyio
     async def test_edit_message_with_card_content_updates_the_card(self):
         adapter = self._make_adapter()
         await adapter.edit_message("a:chat", "m9", _card_block(dict(_CARD, hermes_replace="x")))

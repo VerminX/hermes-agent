@@ -344,6 +344,10 @@ _CARD_FENCE_RE = re.compile(r"```adaptivecard[ \t]*\n(.*?)\n[ \t]*```", re.DOTAL
 _CARD_CONTENT_TYPE = "application/vnd.microsoft.card.adaptive"
 _CARD_MAX_BYTES = 26_000  # Teams caps a whole activity at ~28 KB; leave room for the envelope
 _CARD_REPLACE_KEY = "hermes_replace"
+# Optional plain-text preview for notifications / chat lists. Without an activity ``summary`` Teams
+# previews a text-less card as "Card - access it on https://go.skype.com/cards.unsupported".
+_CARD_SUMMARY_KEY = "hermes_summary"
+_CARD_SUMMARY_MAX_CHARS = 150
 # Card button → user turn: {"hermes_action": "prompt", "text": "<what the clicker 'types'>"}.
 _CARD_PROMPT_ACTION = "prompt"
 _CARD_PROMPT_MAX_CHARS = 500
@@ -366,6 +370,20 @@ def _extract_card(content: str) -> tuple[Optional[dict], str]:
         logger.debug("[teams] adaptivecard block rejected (not an AdaptiveCard object or too large)")
         return None, content
     return card, (content[:match.start()] + content[match.end():]).strip()
+
+
+def _card_summary(card: dict) -> str:
+    """Plain-text preview for a card: explicit ``hermes_summary``, else the first bold TextBlock
+    (else the first TextBlock), markdown markers stripped and length-capped."""
+    explicit = card.get(_CARD_SUMMARY_KEY)
+    if isinstance(explicit, str) and explicit.strip():
+        text = explicit
+    else:
+        blocks = [b for b in card.get("body") or [] if isinstance(b, dict) and b.get("type") == "TextBlock"]
+        chosen = next((b for b in blocks if b.get("weight") == "Bolder"), blocks[0] if blocks else {})
+        text = str(chosen.get("text") or "")
+    text = re.sub(r"[*_`]+", "", text).replace("\n", " ").strip()
+    return _truncate(text, _CARD_SUMMARY_MAX_CHARS) if text else ""
 
 
 def _thread_root(conversation_id: str) -> Optional[str]:
@@ -699,10 +717,16 @@ class TeamsAdapter(BasePlatformAdapter):
             mapping.popitem(last=False)
 
     def _card_activity(self, card: dict, text: str) -> Any:
-        """Message activity carrying ``card`` as an Adaptive Card attachment, ``text`` as its body."""
+        """Message activity carrying ``card`` as an Adaptive Card attachment, ``text`` as its body,
+        and a plain-text ``summary`` for notification / chat-list previews. Hermes-only keys are
+        stripped from the card before it goes out."""
         from microsoft_teams.api import Attachment, MessageActivityInput
+        summary = _card_summary(card)
+        card = {k: v for k, v in card.items() if k not in (_CARD_REPLACE_KEY, _CARD_SUMMARY_KEY)}
         body = self.format_message(text) if text else ""
         activity = MessageActivityInput(text=body) if body else MessageActivityInput()
+        if summary:
+            activity.summary = summary  # not a typed SDK field; the model allows extras on the wire
         return activity.add_attachments(Attachment(content_type=_CARD_CONTENT_TYPE, content=card))
 
     async def _send_card_message(
@@ -881,7 +905,6 @@ class TeamsAdapter(BasePlatformAdapter):
         from microsoft_teams.api import MessageActivityInput
         card, rest = _extract_card(content)
         if card is not None:
-            card = {k: v for k, v in card.items() if k != _CARD_REPLACE_KEY}
             activity = self._card_activity(card, rest)
         else:
             activity = MessageActivityInput(text=(self.truncate_message(self.format_message(content)) or [""])[0])
