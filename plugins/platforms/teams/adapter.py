@@ -19,7 +19,7 @@ import json
 import logging
 import re
 import sys
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import contextmanager, suppress
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import urlparse
@@ -374,6 +374,9 @@ class TeamsAdapter(BasePlatformAdapter):
         self._require_mention: bool = self._parse_require_mention(config)
         # Outbound activity ids (bounded) so require_mention can exempt replies to our own messages.
         self._sent_ids: deque = deque(maxlen=500)
+        # Outbound activity id → the conversation id it was posted to (a channel reply lands in the
+        # ``;messageid=`` thread, not the bare chat_id), so edit_message updates the right activity.
+        self._sent_convs: OrderedDict[str, str] = OrderedDict()
 
     @staticmethod
     def _parse_require_mention(config) -> bool:
@@ -614,14 +617,23 @@ class TeamsAdapter(BasePlatformAdapter):
             result = await self._app.activity_sender.send(activity, conv_ref)
         else:
             result = await self._app.send(chat_id, fallback)
-        self._remember_sent(result)
+        conv = getattr(getattr(conv_ref, "conversation", None), "id", None) if conv_ref else None
+        self._remember_sent(result, conv or chat_id)
         return result
 
-    def _remember_sent(self, result: Any) -> None:
-        """Track an outbound activity id (bounded deque) for the require_mention reply exemption."""
+    _SENT_CONVS_MAX = 500
+
+    def _remember_sent(self, result: Any, conversation_id: Optional[str] = None) -> None:
+        """Track an outbound activity id (bounded deque) for the require_mention reply exemption,
+        and (bounded) which conversation it was posted to for edit_message."""
         sent_id = getattr(result, "id", None)
         if isinstance(sent_id, str) and sent_id:
             self._sent_ids.append(sent_id)
+            if conversation_id:
+                self._sent_convs[sent_id] = conversation_id
+                self._sent_convs.move_to_end(sent_id)
+                while len(self._sent_convs) > self._SENT_CONVS_MAX:
+                    self._sent_convs.popitem(last=False)
 
     @staticmethod
     def _invoke_message(text: str) -> "InvokeResponse[AdaptiveCardActionMessageResponse]":
@@ -715,17 +727,41 @@ class TeamsAdapter(BasePlatformAdapter):
                 if reply_to and reply_to.isdigit() and reply_to != "0":
                     try:
                         result = await self._app.reply(chat_id, reply_to, chunk)
+                        # Same id the SDK's to_threaded_conversation_id() built for reply().
+                        posted_to = f"{chat_id.split(';')[0]};messageid={reply_to}"
                     except Exception as reply_err:
                         # Group chats 400 on threaded sends; the SDK has no typed HTTP errors → fall back on any.
                         logger.debug("Teams reply() failed, falling back to flat send: %s", reply_err)
                         result = await self._app.send(chat_id, chunk)
+                        posted_to = chat_id
                 else:
                     result = await self._app.send(chat_id, chunk)
+                    posted_to = chat_id
                 last_message_id = getattr(result, "id", None)
-                self._remember_sent(result)
+                self._remember_sent(result, posted_to)
             except Exception as e:
                 return SendResult(success=False, error=str(e), retryable=True)
         return SendResult(success=True, message_id=last_message_id)
+
+    async def edit_message(
+        self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
+        """Replace one of our messages in place (Bot Framework updateActivity). An edit targets a
+        single activity, so content past one Teams message is truncated rather than split; Teams
+        has no in-progress message state, so ``finalize`` needs no extra call."""
+        if not self._app:
+            return SendResult(success=False, error="Teams app not initialized")
+        if not message_id:
+            return SendResult(success=False, error="No message id to edit")
+        from microsoft_teams.api import MessageActivityInput
+        chunks = self.truncate_message(self.format_message(content)) or [""]
+        conversation_id = self._sent_convs.get(message_id, chat_id)
+        try:
+            await self._app.api.conversations.activities(conversation_id).update(
+                message_id, MessageActivityInput(text=chunks[0]))
+        except Exception as e:
+            logger.debug("[teams] edit_message failed (chat=%s, msg=%s): %s", chat_id, message_id, e)
+            return SendResult(success=False, error=str(e), retryable=True)
+        return SendResult(success=True, message_id=message_id)
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         if self._app:
