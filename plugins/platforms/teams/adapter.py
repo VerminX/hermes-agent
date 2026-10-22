@@ -335,6 +335,44 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + "..." if len(text) > limit else text
 
 
+# Agent-authored Adaptive Cards: a ```adaptivecard fenced JSON block in an outbound message is sent
+# as a card attachment (the rest of the text rides along as the message body). A card carrying
+# "hermes_replace": "<key>" edits the previous card sent with that key in the same conversation
+# instead of posting a new one — a live status card the agent can re-send at every stage.
+_CARD_FENCE_RE = re.compile(r"```adaptivecard[ \t]*\n(.*?)\n[ \t]*```", re.DOTALL)
+_CARD_CONTENT_TYPE = "application/vnd.microsoft.card.adaptive"
+_CARD_MAX_BYTES = 26_000  # Teams caps a whole activity at ~28 KB; leave room for the envelope
+_CARD_REPLACE_KEY = "hermes_replace"
+# Card button → user turn: {"hermes_action": "prompt", "text": "<what the clicker 'types'>"}.
+_CARD_PROMPT_ACTION = "prompt"
+_CARD_PROMPT_MAX_CHARS = 500
+
+
+def _extract_card(content: str) -> tuple[Optional[dict], str]:
+    """``(card, remaining_text)`` for the first valid ```adaptivecard block, else ``(None, content)``.
+    Invalid JSON, a non-AdaptiveCard object, or an oversized card leaves the text untouched so it
+    still reaches the user as a normal message."""
+    match = _CARD_FENCE_RE.search(content or "")
+    if not match:
+        return None, content
+    raw = match.group(1)
+    try:
+        card = json.loads(raw)
+    except ValueError:
+        logger.debug("[teams] adaptivecard block is not valid JSON; sending as text")
+        return None, content
+    if not isinstance(card, dict) or card.get("type") != "AdaptiveCard" or len(raw.encode()) > _CARD_MAX_BYTES:
+        logger.debug("[teams] adaptivecard block rejected (not an AdaptiveCard object or too large)")
+        return None, content
+    return card, (content[:match.start()] + content[match.end():]).strip()
+
+
+def _thread_root(conversation_id: str) -> Optional[str]:
+    """Channel thread root message id from a ``...;messageid=<id>`` conversation id, else None."""
+    _, sep, root = (conversation_id or "").partition(";messageid=")
+    return root if sep and root.isdigit() else None
+
+
 def _approval_body(cmd: str, desc: str, *, always: bool = False) -> list:
     """Adaptive Card body blocks for an approval prompt; unless ``always``, empty ``cmd``/``desc`` omit their blocks."""
     body = []
@@ -377,6 +415,8 @@ class TeamsAdapter(BasePlatformAdapter):
         # Outbound activity id → the conversation id it was posted to (a channel reply lands in the
         # ``;messageid=`` thread, not the bare chat_id), so edit_message updates the right activity.
         self._sent_convs: OrderedDict[str, str] = OrderedDict()
+        # (conversation id, hermes_replace key) → activity id of the card to edit next time.
+        self._replace_cards: OrderedDict[tuple[str, str], str] = OrderedDict()
 
     @staticmethod
     def _parse_require_mention(config) -> bool:
@@ -520,22 +560,39 @@ class TeamsAdapter(BasePlatformAdapter):
                 return
         if "<at>" in text:  # strip the <at>BotName</at> tags Teams prepends for @mentions
             text = re.sub(r"<at>[^<]*</at>\s*", "", text).strip()
-        from_account = activity.from_
-        user_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
-        source = self.build_source(
-            chat_id=conv.id,
-            chat_name=getattr(conv, "name", None) or "",
-            chat_type=_CHAT_TYPES.get(getattr(conv, "conversation_type", None) or "", "dm"),
-            user_id=str(user_id),
-            user_name=getattr(from_account, "name", None) or "",
-            guild_id=getattr(conv, "tenant_id", None) or self._tenant_id,
-            message_id=msg_id)
+        source = self._source_for(activity, msg_id)
         media: list = [m for m in [await self._cache_attachment(a) for a in getattr(activity, "attachments", None) or []] if m]
         media_kinds = [kind for _, _, kind in media]  # media items are (path, media_type, kind)
         msg_type = next((t for kind, t in _MEDIA_KIND_PRECEDENCE if kind in media_kinds), MessageType.TEXT)
         await self.handle_message(MessageEvent(
             text=text, source=source, message_type=msg_type, message_id=msg_id,
             media_urls=[path for path, _, _ in media], media_types=[mt for _, mt, _ in media]))
+
+    def _source_for(self, activity: Any, message_id: Optional[str]) -> Any:
+        """Session source for an inbound activity (message or card invoke) — the same chat/user
+        identity either way, so a button click lands in the conversation's existing session."""
+        conv = activity.conversation
+        from_account = activity.from_
+        user_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
+        return self.build_source(
+            chat_id=conv.id,
+            chat_name=getattr(conv, "name", None) or "",
+            chat_type=_CHAT_TYPES.get(getattr(conv, "conversation_type", None) or "", "dm"),
+            user_id=str(user_id),
+            user_name=getattr(from_account, "name", None) or "",
+            guild_id=getattr(conv, "tenant_id", None) or self._tenant_id,
+            message_id=message_id)
+
+    async def _dispatch_card_prompt(self, ctx: Any, text: str) -> None:
+        """Feed a card button's ``text`` into the clicker's conversation as if they had typed it.
+        Replies thread under the channel thread root (the invoke's own id is not a message id)."""
+        activity = ctx.activity
+        conv_id = getattr(activity.conversation, "id", None) or ""
+        if conv_id and getattr(ctx, "conversation_ref", None) is not None:
+            self._conv_refs.setdefault(conv_id, ctx.conversation_ref)
+        root = _thread_root(conv_id)
+        await self.handle_message(MessageEvent(
+            text=text, source=self._source_for(activity, root), message_type=MessageType.TEXT, message_id=root))
 
     @staticmethod
     def _activity_mentions_bot(activity: Any, bot_ids: set, text: str) -> bool:
@@ -630,10 +687,59 @@ class TeamsAdapter(BasePlatformAdapter):
         if isinstance(sent_id, str) and sent_id:
             self._sent_ids.append(sent_id)
             if conversation_id:
-                self._sent_convs[sent_id] = conversation_id
-                self._sent_convs.move_to_end(sent_id)
-                while len(self._sent_convs) > self._SENT_CONVS_MAX:
-                    self._sent_convs.popitem(last=False)
+                self._bounded_put(self._sent_convs, sent_id, conversation_id)
+
+    @classmethod
+    def _bounded_put(cls, mapping: OrderedDict, key: Any, value: Any) -> None:
+        """Insert as most-recent and evict the oldest entries past ``_SENT_CONVS_MAX``."""
+        mapping[key] = value
+        mapping.move_to_end(key)
+        while len(mapping) > cls._SENT_CONVS_MAX:
+            mapping.popitem(last=False)
+
+    def _card_activity(self, card: dict, text: str) -> Any:
+        """Message activity carrying ``card`` as an Adaptive Card attachment, ``text`` as its body."""
+        from microsoft_teams.api import Attachment, MessageActivityInput
+        body = self.format_message(text) if text else ""
+        activity = MessageActivityInput(text=body) if body else MessageActivityInput()
+        return activity.add_attachments(Attachment(content_type=_CARD_CONTENT_TYPE, content=card))
+
+    async def _send_card_message(
+        self, chat_id: str, card: dict, text: str, reply_to: Optional[str]
+    ) -> SendResult:
+        """Send an agent-authored card; with a ``hermes_replace`` key, edit the previous card sent
+        under that key in the same conversation and only post anew when there is none (or the edit
+        fails — e.g. the original was deleted)."""
+        card = dict(card)
+        replace_key = card.pop(_CARD_REPLACE_KEY, None)
+        threaded = bool(reply_to and reply_to.isdigit() and reply_to != "0")
+        target = f"{chat_id.split(';')[0]};messageid={reply_to}" if threaded else chat_id
+        activity = self._card_activity(card, text)
+        slot = (target, str(replace_key)) if replace_key else None
+        prior = self._replace_cards.get(slot) if slot else None
+        if prior:
+            try:
+                await self._app.api.conversations.activities(target).update(prior, activity)
+                return SendResult(success=True, message_id=prior)
+            except Exception as e:
+                logger.debug("[teams] replace-card edit failed (key=%s), posting a new card: %s", replace_key, e)
+        try:
+            if threaded:
+                try:
+                    result = await self._app.reply(chat_id, reply_to, activity)
+                except Exception as reply_err:
+                    logger.debug("Teams reply() failed for card, falling back to flat send: %s", reply_err)
+                    result = await self._app.send(chat_id, activity)
+                    target = chat_id
+            else:
+                result = await self._app.send(chat_id, activity)
+        except Exception as e:
+            return SendResult(success=False, error=str(e), retryable=True)
+        sent_id = getattr(result, "id", None)
+        self._remember_sent(result, target)
+        if slot and isinstance(sent_id, str) and sent_id:
+            self._bounded_put(self._replace_cards, (target, slot[1]), sent_id)
+        return SendResult(success=True, message_id=sent_id)
 
     @staticmethod
     def _invoke_message(text: str) -> "InvokeResponse[AdaptiveCardActionMessageResponse]":
@@ -651,6 +757,8 @@ class TeamsAdapter(BasePlatformAdapter):
 
         data = ctx.activity.value.action.data or {}
         hermes_action = data.get("hermes_action", "")
+        if hermes_action == _CARD_PROMPT_ACTION:
+            return await self._on_card_prompt(ctx, data)
         session_key = data.get("session_key", "")
         if not hermes_action or not session_key:
             return self._invoke_message(t("platform.teams.approval.unknown_action"))
@@ -666,6 +774,20 @@ class TeamsAdapter(BasePlatformAdapter):
         body = _approval_body(data.get("cmd", ""), data.get("desc", ""))
         body.append(TextBlock(text=t(_APPROVAL_LABEL_KEYS[choice]), wrap=True, weight="Bolder"))
         return self._invoke_card(body)
+
+    async def _on_card_prompt(
+        self, ctx: ActivityContext[AdaptiveCardInvokeActivity], data: dict
+    ) -> InvokeResponse[AdaptiveCardActionMessageResponse]:
+        """Agent-authored button: same allowlist gate as approvals, then the button's text becomes
+        the clicker's next turn in that conversation. The card itself is left as-is."""
+        denied = self._card_action_denied(ctx.activity.from_)
+        if denied:
+            return self._invoke_message(denied)
+        text = str(data.get("text") or "").strip()[:_CARD_PROMPT_MAX_CHARS]
+        if not text:
+            return self._invoke_message(t("platform.teams.approval.unknown_action"))
+        await self._dispatch_card_prompt(ctx, text)
+        return self._invoke_message(f"▶ {text}")
 
     @staticmethod
     def _card_action_denied(from_account: Any) -> Optional[str]:
@@ -721,6 +843,9 @@ class TeamsAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not self._app:
             return SendResult(success=False, error="Teams app not initialized")
+        card, rest = _extract_card(content)
+        if card is not None:
+            return await self._send_card_message(chat_id, card, rest, reply_to)
         last_message_id = None
         for chunk in self.truncate_message(self.format_message(content)):
             try:
@@ -753,11 +878,15 @@ class TeamsAdapter(BasePlatformAdapter):
         if not message_id:
             return SendResult(success=False, error="No message id to edit")
         from microsoft_teams.api import MessageActivityInput
-        chunks = self.truncate_message(self.format_message(content)) or [""]
+        card, rest = _extract_card(content)
+        if card is not None:
+            card = {k: v for k, v in card.items() if k != _CARD_REPLACE_KEY}
+            activity = self._card_activity(card, rest)
+        else:
+            activity = MessageActivityInput(text=(self.truncate_message(self.format_message(content)) or [""])[0])
         conversation_id = self._sent_convs.get(message_id, chat_id)
         try:
-            await self._app.api.conversations.activities(conversation_id).update(
-                message_id, MessageActivityInput(text=chunks[0]))
+            await self._app.api.conversations.activities(conversation_id).update(message_id, activity)
         except Exception as e:
             logger.debug("[teams] edit_message failed (chat=%s, msg=%s): %s", chat_id, message_id, e)
             return SendResult(success=False, error=str(e), retryable=True)

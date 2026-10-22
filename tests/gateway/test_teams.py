@@ -1224,3 +1224,196 @@ class TestTeamsEditMessage:
     async def test_edit_without_app_fails_cleanly(self):
         adapter = TeamsAdapter(_make_config(client_id="bot-id", client_secret="secret", tenant_id="tenant"))
         assert not (await adapter.edit_message("a:chat", "m1", "x")).success
+
+
+# ---------------------------------------------------------------------------
+# Tests: agent-authored Adaptive Cards, replace-in-place cards, and card prompt buttons
+# ---------------------------------------------------------------------------
+
+class _FakeAttachment:
+    def __init__(self, content_type=None, content=None, content_url=None):
+        self.content_type, self.content, self.content_url = content_type, content, content_url
+
+
+class _FakeMessageActivityInput:
+    def __init__(self, text=None):
+        self.text, self.attachments = text, []
+
+    def add_attachments(self, *atts):
+        self.attachments.extend(atts)
+        return self
+
+
+def _card_block(card):
+    import json as _json
+    return f"```adaptivecard\n{_json.dumps(card)}\n```"
+
+
+_CARD = {"type": "AdaptiveCard", "version": "1.5", "body": [{"type": "TextBlock", "text": "Findings"}]}
+
+
+class TestTeamsAgentCards:
+    THREAD = "19:chan@thread.tacv2;messageid=1700000000001"
+
+    @pytest.fixture(autouse=True)
+    def _fake_activity_classes(self, monkeypatch):
+        api = sys.modules["microsoft_teams.api"]
+        monkeypatch.setattr(api, "MessageActivityInput", _FakeMessageActivityInput, raising=False)
+        monkeypatch.setattr(api, "Attachment", _FakeAttachment, raising=False)
+
+    def _make_adapter(self):
+        adapter = TeamsAdapter(_make_config(client_id="bot-id", client_secret="secret", tenant_id="tenant"))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        ids = iter(range(1, 10**6))
+        adapter._app.send = AsyncMock(side_effect=lambda *a, **k: SimpleNamespace(id=f"m{next(ids)}"))
+        adapter._app.reply = AsyncMock(side_effect=lambda *a, **k: SimpleNamespace(id=f"r{next(ids)}"))
+        self.ops = MagicMock()
+        self.ops.update = AsyncMock()
+        adapter._app.api.conversations.activities = MagicMock(return_value=self.ops)
+        return adapter
+
+    @staticmethod
+    def _sent_activity(mock):
+        return mock.await_args.args[-1]
+
+    @pytest.mark.anyio
+    async def test_card_block_is_sent_as_an_adaptive_card_with_surrounding_text(self):
+        adapter = self._make_adapter()
+        result = await adapter.send(self.THREAD, f"Review done.\n\n{_card_block(_CARD)}")
+
+        assert result.success
+        activity = self._sent_activity(adapter._app.send)
+        (att,) = activity.attachments
+        assert att.content_type == "application/vnd.microsoft.card.adaptive"
+        assert att.content == _CARD
+        assert "Review done." in activity.text and "adaptivecard" not in activity.text
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("bad", [
+        "```adaptivecard\n{not json}\n```",
+        _card_block({"type": "MessageCard"}),
+        _card_block({"type": "AdaptiveCard", "body": [{"type": "TextBlock", "text": "x" * 30_000}]}),
+    ])
+    async def test_invalid_card_falls_back_to_text(self, bad):
+        adapter = self._make_adapter()
+        await adapter.send("a:chat", bad)
+        sent = adapter._app.send.await_args.args[-1]
+        assert isinstance(sent, str)  # plain text path, nothing swallowed
+
+    @pytest.mark.anyio
+    async def test_replace_key_edits_the_previous_card_instead_of_posting(self):
+        adapter = self._make_adapter()
+        status = dict(_CARD, hermes_replace="status")
+        first = await adapter.send(self.THREAD, _card_block(status))
+        second = await adapter.send(self.THREAD, _card_block(dict(status, body=[{"type": "TextBlock", "text": "QA"}])))
+
+        assert adapter._app.send.await_count == 1
+        assert second.message_id == first.message_id
+        activity_id, activity = self.ops.update.await_args.args
+        assert activity_id == first.message_id
+        assert "hermes_replace" not in activity.attachments[0].content
+        assert activity.attachments[0].content["body"][0]["text"] == "QA"
+        adapter._app.api.conversations.activities.assert_called_with(self.THREAD)
+
+    @pytest.mark.anyio
+    async def test_replace_key_is_scoped_per_conversation(self):
+        adapter = self._make_adapter()
+        status = _card_block(dict(_CARD, hermes_replace="status"))
+        await adapter.send("19:chan@thread.tacv2;messageid=1", status)
+        await adapter.send("19:chan@thread.tacv2;messageid=2", status)
+
+        assert adapter._app.send.await_count == 2
+        self.ops.update.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_failed_replace_edit_posts_a_new_card_and_tracks_it(self):
+        adapter = self._make_adapter()
+        status = _card_block(dict(_CARD, hermes_replace="status"))
+        await adapter.send(self.THREAD, status)
+        self.ops.update.side_effect = RuntimeError("404 activity gone")
+        replacement = await adapter.send(self.THREAD, status)
+        self.ops.update.side_effect = None
+        await adapter.send(self.THREAD, status)
+
+        assert adapter._app.send.await_count == 2
+        assert self.ops.update.await_args.args[0] == replacement.message_id
+
+    @pytest.mark.anyio
+    async def test_card_without_replace_key_always_posts_new(self):
+        adapter = self._make_adapter()
+        await adapter.send(self.THREAD, _card_block(_CARD))
+        await adapter.send(self.THREAD, _card_block(_CARD))
+        assert adapter._app.send.await_count == 2
+
+    @pytest.mark.anyio
+    async def test_threaded_card_reply_lands_in_the_reply_thread(self):
+        adapter = self._make_adapter()
+        await adapter.send(self.THREAD, _card_block(_CARD), reply_to="1700000000042")
+        conv, msg_id, activity = adapter._app.reply.await_args.args
+        assert (conv, msg_id) == (self.THREAD, "1700000000042")
+        assert activity.attachments[0].content == _CARD
+
+    @pytest.mark.anyio
+    async def test_edit_message_with_card_content_updates_the_card(self):
+        adapter = self._make_adapter()
+        await adapter.edit_message("a:chat", "m9", _card_block(dict(_CARD, hermes_replace="x")))
+        _, activity = self.ops.update.await_args.args
+        assert activity.attachments[0].content == _CARD
+
+
+class TestTeamsCardPromptButtons:
+    THREAD = "19:chan@thread.tacv2;messageid=1700000000001"
+
+    def _make_adapter(self, monkeypatch, allow_all=True):
+        if allow_all:
+            monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        else:
+            monkeypatch.delenv("TEAMS_ALLOW_ALL_USERS", raising=False)
+            monkeypatch.setenv("TEAMS_ALLOWED_USERS", "aad-someone-else")
+        adapter = TeamsAdapter(_make_config(client_id="bot-id", client_secret="secret", tenant_id="tenant"))
+        adapter._app = MagicMock()
+        adapter.handle_message = AsyncMock()
+        return adapter
+
+    def _invoke(self, data, conversation_id=None):
+        ctx = MagicMock()
+        ctx.activity.value.action.data = data
+        ctx.activity.from_ = MagicMock(aad_object_id="aad-clicker", id="29:clicker")
+        ctx.activity.from_.name = "Clicker"
+        ctx.activity.conversation = MagicMock(conversation_type="channel", tenant_id="t")
+        ctx.activity.conversation.id = conversation_id or self.THREAD
+        ctx.activity.conversation.name = "PR Review Channel"
+        return ctx
+
+    @pytest.mark.anyio
+    async def test_prompt_button_becomes_the_clickers_turn_in_that_thread(self, monkeypatch):
+        adapter = self._make_adapter(monkeypatch)
+        await adapter._on_card_action(self._invoke({"hermes_action": "prompt", "text": "re-review"}))
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "re-review"
+        assert event.source.chat_id == self.THREAD
+        assert event.source.user_id == "aad-clicker"
+        assert event.message_id == "1700000000001"  # replies thread under the root post
+
+    @pytest.mark.anyio
+    async def test_prompt_button_respects_the_allowlist(self, monkeypatch):
+        adapter = self._make_adapter(monkeypatch, allow_all=False)
+        await adapter._on_card_action(self._invoke({"hermes_action": "prompt", "text": "re-review"}))
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_prompt_text_is_bounded_and_required(self, monkeypatch):
+        adapter = self._make_adapter(monkeypatch)
+        await adapter._on_card_action(self._invoke({"hermes_action": "prompt", "text": "   "}))
+        adapter.handle_message.assert_not_awaited()
+
+        await adapter._on_card_action(self._invoke({"hermes_action": "prompt", "text": "x" * 5000}))
+        assert len(adapter.handle_message.await_args.args[0].text) <= 500
+
+    @pytest.mark.anyio
+    async def test_dm_prompt_has_no_thread_root(self, monkeypatch):
+        adapter = self._make_adapter(monkeypatch)
+        await adapter._on_card_action(self._invoke({"hermes_action": "prompt", "text": "help"}, "a:dm-chat"))
+        assert adapter.handle_message.await_args.args[0].message_id is None
