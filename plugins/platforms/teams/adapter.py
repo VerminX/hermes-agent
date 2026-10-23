@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import sys
+import uuid
 from collections import OrderedDict, deque
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -604,14 +605,19 @@ class TeamsAdapter(BasePlatformAdapter):
 
     async def _dispatch_card_prompt(self, ctx: Any, text: str) -> None:
         """Feed a card button's ``text`` into the clicker's conversation as if they had typed it.
-        Replies thread under the channel thread root (the invoke's own id is not a message id)."""
+        Replies thread under the channel thread root (the invoke's own id is not a message id).
+        The root is also the id of the post that started the thread, so each click carries its
+        invoke id as ``edit_revision``: native admission keys it apart from that post instead of
+        refusing it as a changed replay (``admission_conflict``)."""
         activity = ctx.activity
         conv_id = getattr(activity.conversation, "id", None) or ""
         if conv_id and getattr(ctx, "conversation_ref", None) is not None:
             self._conv_refs.setdefault(conv_id, ctx.conversation_ref)
         root = _thread_root(conv_id)
+        click = getattr(activity, "id", None)
         await self.handle_message(MessageEvent(
-            text=text, source=self._source_for(activity, root), message_type=MessageType.TEXT, message_id=root))
+            text=text, source=self._source_for(activity, root), message_type=MessageType.TEXT, message_id=root,
+            edit_revision=f"card:{click if isinstance(click, str) and click else uuid.uuid4().hex}"))
 
     @staticmethod
     def _activity_mentions_bot(activity: Any, bot_ids: set, text: str) -> bool:

@@ -1422,6 +1422,22 @@ class TestTeamsCardPromptButtons:
         assert event.message_id == "1700000000001"  # replies thread under the root post
 
     @pytest.mark.anyio
+    async def test_each_click_is_admitted_apart_from_the_root_post(self, monkeypatch):
+        adapter = self._make_adapter(monkeypatch)
+        revisions = []
+        for click_id in ("f:click-1", "f:click-2"):
+            ctx = self._invoke({"hermes_action": "prompt", "text": "re-review"})
+            ctx.activity.id = click_id
+            await adapter._on_card_action(ctx)
+            revisions.append(adapter.handle_message.await_args.args[0].edit_revision)
+        assert revisions == ["card:f:click-1", "card:f:click-2"]
+
+        ctx = self._invoke({"hermes_action": "prompt", "text": "re-review"})
+        ctx.activity.id = None
+        await adapter._on_card_action(ctx)
+        assert adapter.handle_message.await_args.args[0].edit_revision.startswith("card:")
+
+    @pytest.mark.anyio
     async def test_prompt_button_respects_the_allowlist(self, monkeypatch):
         adapter = self._make_adapter(monkeypatch, allow_all=False)
         await adapter._on_card_action(self._invoke({"hermes_action": "prompt", "text": "re-review"}))
